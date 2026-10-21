@@ -4,12 +4,20 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Meglévő tag, amelyhez a Windows telepítő készül (például v4.9.2-1)"
+        required: true
 
 permissions:
   contents: write
 
 jobs:
   release:
+    # A "-N" végű (forkolt javító) tageknek nincs saját CHANGELOG-szakasza,
+    # ezért azoknál a Windows job hozza létre a kiadást.
+    if: github.event_name == 'push' && !contains(github.ref_name, '-')
     runs-on: ubuntu-latest
     steps:
       - name: Forrás letöltése
@@ -48,3 +56,59 @@ jobs:
               --title "Auris ${GITHUB_REF_NAME#v}" \
               --notes-file release-notes.md
           fi
+
+  windows-installer:
+    needs: release
+    if: always() && (needs.release.result == 'success' || needs.release.result == 'skipped')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Forrás letöltése
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Python 3.11 beállítása
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Build-környezet telepítése
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m venv reader\.venv
+          $py = "reader\.venv\Scripts\python.exe"
+          & $py -m pip install --upgrade pip setuptools wheel packaging
+          & $py -m pip install torch==2.11.0+cpu torchaudio==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu
+          & $py -m pip install -r reader\requirements.txt wetext
+          & $py -m pip install --target reader\.higgs_runtime --no-deps transformers==5.13.0
+          & $py -m spacy download en_core_web_sm
+          & $py -c "import sys; sys.path.insert(0, 'reader'); from core.settings import install_spacy_model; r = install_spacy_model('hu'); print(r); sys.exit(0 if r.get('ok') else 1)"
+
+      - name: Verzió beállítása a tagből
+        run: Set-Content -Path VERSION -Value $env:TAG.TrimStart('v') -NoNewline
+
+      - name: Windows telepítő buildelése
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          reader\.venv\Scripts\python.exe scripts\windows\build.py
+
+      - name: Csatolás a kiadáshoz
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --verify-tag --title "Auris $($env:TAG.TrimStart('v'))" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "A kiadás létrehozása nem sikerült" }
+          }
+          $files = Get-ChildItem dist\windows -File | Where-Object { $_.Name -match '\.(exe|json|txt|zip)$' } | ForEach-Object { $_.FullName }
+          gh release upload $env:TAG @files --clobber
+          if ($LASTEXITCODE -ne 0) { throw "A feltöltés nem sikerült" }
